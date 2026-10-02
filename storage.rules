@@ -1,0 +1,30 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signed() { return request.auth != null; }
+    function isStaff() {
+      return signed() && request.auth.token.email_verified == true
+        && request.auth.token.email == 'negocios.wagnermarques@gmail.com';
+    }
+    function img() {
+      return request.resource.contentType.matches('image/.*') && request.resource.size < 5 * 1024 * 1024;
+    }
+    function inCoop(c) {
+      return signed() && request.auth.uid in firestore.get(/databases/(default)/documents/coops/$(c)).data.members;
+    }
+
+    // Mídia de postagens do Home e fotos de perfil: pública na web.
+    match /public/{u}/{file} {
+      allow read: if true;
+      allow create, update: if signed() && request.auth.uid == u && img();
+      allow delete: if (signed() && request.auth.uid == u) || isStaff();
+    }
+
+    // Mídia privada dos CO-OPs: só membros (e a Staff).
+    match /coops/{c}/{file} {
+      allow read: if inCoop(c) || isStaff();
+      allow create: if inCoop(c) && request.resource.size < 50 * 1024 * 1024;
+      allow delete: if isStaff();
+    }
+  }
+}

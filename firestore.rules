@@ -1,0 +1,95 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+    function signed() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function isStaff() {
+      return signed() && request.auth.token.email_verified == true
+        && request.auth.token.email == 'negocios.wagnermarques@gmail.com';
+    }
+    function active() {
+      return signed() && get(/databases/$(db)/documents/users/$(uid())).data.status == 'ok';
+    }
+    function coop(c) { return get(/databases/$(db)/documents/coops/$(c)).data; }
+    function member(c) { return signed() && uid() in coop(c).members; }
+    function admin(c) { return signed() && (uid() == coop(c).owner || uid() in coop(c).mods); }
+
+    match /users/{u} {
+      allow read: if true;
+      allow create: if signed() && uid() == u && request.resource.data.role == 'user'
+        && request.resource.data.plan == 'free' && request.resource.data.status == 'ok';
+      allow update: if isStaff() || (uid() == u
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'plan', 'status']));
+      allow delete: if isStaff() || uid() == u;
+      match /private/{d} { allow read, write: if uid() == u || isStaff(); }
+    }
+
+    match /coops/{c} {
+      allow read: if signed() && (uid() in resource.data.members || isStaff());
+      allow create: if active() && request.resource.data.owner == uid()
+        && request.resource.data.members == [uid()] && request.resource.data.mods == [];
+      allow update: if isStaff() || (signed()
+        && request.resource.data.owner == resource.data.owner
+        && request.resource.data.owner in request.resource.data.members
+        && request.resource.data.mods.size() <= 2
+        && (uid() == resource.data.owner
+            || (uid() in resource.data.mods && request.resource.data.mods == resource.data.mods)));
+      allow delete: if isStaff() || (signed() && uid() == resource.data.owner);
+
+      match /channels/{ch} {
+        allow read: if member(c) || isStaff();
+        allow create, update, delete: if admin(c) || isStaff();
+        match /messages/{m} {
+          allow read: if member(c) || isStaff();
+          allow create: if member(c) && active() && request.resource.data.from == uid();
+          allow delete: if admin(c) || isStaff() || resource.data.from == uid();
+        }
+      }
+      match /tables/{t} {
+        allow read: if member(c) || isStaff();
+        allow create, update: if member(c) && active();
+        allow delete: if admin(c) || isStaff();
+      }
+      match /events/{e} {
+        allow read: if member(c) || isStaff();
+        allow create, update: if member(c) && active();
+        allow delete: if admin(c) || isStaff();
+      }
+    }
+
+    match /posts/{p} {
+      allow read: if true;
+      allow create: if active() && request.resource.data.by == uid() && request.resource.data.views == 0;
+      allow update: if isStaff()
+        || (signed() && resource.data.by == uid() && request.resource.data.by == uid())
+        || (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['views'])
+            && request.resource.data.views == resource.data.views + 1);
+      allow delete: if isStaff() || (signed() && resource.data.by == uid());
+      match /likes/{u} {
+        allow read: if true;
+        allow create, delete: if signed() && uid() == u;
+      }
+      match /comments/{k} {
+        allow read: if true;
+        allow create: if active() && request.resource.data.by == uid();
+        allow delete: if isStaff() || (signed() && resource.data.by == uid());
+      }
+    }
+
+    match /tickets/{t} {
+      allow read: if signed() && (resource.data.by == uid() || isStaff());
+      allow create: if active() && request.resource.data.by == uid();
+      allow update: if isStaff();
+      match /messages/{m} {
+        allow read: if signed() && (get(/databases/$(db)/documents/tickets/$(t)).data.by == uid() || isStaff());
+        allow create: if signed() && request.resource.data.from == uid()
+          && (get(/databases/$(db)/documents/tickets/$(t)).data.by == uid() || isStaff());
+      }
+    }
+
+    match /audit/{a} {
+      allow read: if isStaff();
+      allow create: if isStaff() && request.resource.data.by == request.auth.token.email;
+    }
+  }
+}
