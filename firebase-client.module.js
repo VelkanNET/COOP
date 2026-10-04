@@ -15,6 +15,7 @@ import {
   arrayUnion,
   collection,
   doc,
+  getDoc,
   getDocs,
   getFirestore,
   increment,
@@ -34,7 +35,6 @@ const config = {
   apiKey: "AIzaSyCLBoUbZscTPM2UroAm-VQzkM0jO2_S2Rs",
   authDomain: "coop-daf1b.firebaseapp.com",
   projectId: "coop-daf1b",
-  storageBucket: "coop-daf1b.firebasestorage.app",
   messagingSenderId: "982176801029",
   appId: "1:982176801029:web:8420b7e7626fcdb18e976c",
   measurementId: "G-W1F0H56CN8"
@@ -43,16 +43,110 @@ const config = {
 const app = initializeApp(config);
 const auth = getAuth(app);
 const db = getFirestore(app, "default");
-const billingWorkerUrl = "";
+const billingWorkerUrl = "https://coop-billing.coop-daf1b.workers.dev";
 const staffWorkerUrl = billingWorkerUrl;
 let profileUnsubscribe = null;
 let postsUnsubscribe = null;
 let coopsUnsubscribe = null;
+let coopFeedUnsubscribe = null;
+let coopMessagesUnsubscribe = null;
 let ticketsUnsubscribe = null;
 let usersUnsubscribe = null;
 let auditUnsubscribe = null;
+let suffixesUnsubscribe = null;
 const postAuthorUnsubscribes = new Map();
 const postAuthors = new Map();
+const ownerProfileCache = new Map();
+const loadedAssetUrls = new Map();
+
+async function readUserByEmail(email) {
+  const result = await getDocs(query(collection(db, "users"), where("email", "==", email), limit(1)));
+  const profile = result.docs[0];
+  return profile ? { uid: profile.id, ...profile.data() } : null;
+}
+
+function effectivePlan(profile) {
+  const plan = profile?.plan || "free";
+  const expiresAt = profile?.planExpiresAt?.toDate?.()?.getTime?.() || 0;
+  return plan !== "free" && (profile?.subscriptionStatus === "staff-managed" || expiresAt > Date.now())
+    ? plan
+    : "free";
+}
+
+function encodeBase64(bytes) {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+async function loadAsset(assetId) {
+  if (!/^[a-f0-9-]{36}$/i.test(assetId)) throw new Error("Identificador de arquivo inválido.");
+  if (loadedAssetUrls.has(assetId)) return loadedAssetUrls.get(assetId);
+  const assetRef = doc(db, "assets", assetId);
+  const snapshot = await getDoc(assetRef);
+  if (!snapshot.exists() || !snapshot.data().ready) {
+    throw new Error("O arquivo não existe ou ainda não terminou de enviar.");
+  }
+  const metadata = snapshot.data();
+  if (!Number.isInteger(metadata.size) || metadata.size < 0 || metadata.size > 10 * 1024 * 1024
+      || !Number.isInteger(metadata.chunkCount) || metadata.chunkCount < 1 || metadata.chunkCount > 20
+      || metadata.uploadedBytes !== metadata.size || metadata.uploadedChunks !== metadata.chunkCount) {
+    throw new Error("Os dados do arquivo estão inválidos.");
+  }
+  const chunks = await getDocs(query(
+    collection(db, "assets", assetId, "chunks"),
+    orderBy("index")
+  ));
+  if (chunks.size !== metadata.chunkCount) throw new Error("O arquivo está incompleto.");
+  const bytes = new Uint8Array(metadata.size);
+  let offset = 0;
+  chunks.docs.forEach((chunk, index) => {
+    const data = chunk.data();
+    if (data.index !== index || typeof data.data !== "string") {
+      throw new Error("A sequência de partes do arquivo está inválida.");
+    }
+    const binary = atob(data.data);
+    if (offset + binary.length > bytes.length) throw new Error("O tamanho das partes não confere.");
+    for (let position = 0; position < binary.length; position += 1) {
+      bytes[offset + position] = binary.charCodeAt(position);
+    }
+    offset += binary.length;
+  });
+  if (offset !== metadata.size) throw new Error("O arquivo recebido está incompleto.");
+  const url = URL.createObjectURL(new Blob([bytes], { type: metadata.contentType }));
+  loadedAssetUrls.set(assetId, url);
+  return url;
+}
+
+async function trimFreeCoopHistory(coopId, coopData) {
+  let ownerUid = coopData.ownerUid;
+  if (!ownerUid) ownerUid = (await readUserByEmail(coopData.owner))?.uid;
+  if (!ownerUid) throw new Error(`Não foi possível identificar o responsável pelo CO-OP ${coopId}.`);
+  if (!ownerProfileCache.has(ownerUid)) {
+    ownerProfileCache.set(ownerUid, getDoc(doc(db, "users", ownerUid)).then(snapshot => {
+      if (!snapshot.exists()) throw new Error("O perfil do responsável pelo CO-OP não foi encontrado.");
+      return snapshot.data();
+    }));
+  }
+  const owner = await ownerProfileCache.get(ownerUid);
+  if (effectivePlan(owner) !== "free") return;
+  const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000 + 60_000;
+  const ref = doc(db, "coops", coopId);
+  await runTransaction(db, async transaction => {
+    const snapshot = await transaction.get(ref);
+    if (!snapshot.exists()) return;
+    const channels = snapshot.data().ch || [];
+    const trimmed = channels.map(channel => ({
+      ...channel,
+      m: (channel.m || []).filter(message => message.t >= cutoff)
+    }));
+    if (trimmed.some((channel, index) => channel.m.length !== (channels[index].m || []).length)) {
+      transaction.update(ref, { ch: trimmed });
+    }
+  });
+}
 
 async function callBillingWorker(path, body = {}) {
   if (!billingWorkerUrl) {
@@ -102,6 +196,9 @@ async function ensureUser(user) {
 }
 
 window.coopFirebase = {
+  get billingReady() {
+    return Boolean(billingWorkerUrl);
+  },
   ensureUser,
   watchProfile(uid, callback) {
     if (profileUnsubscribe) profileUnsubscribe();
@@ -129,13 +226,192 @@ window.coopFirebase = {
       : query(collection(db, "coops"), where("members", "array-contains", email));
     coopsUnsubscribe = onSnapshot(
       coopsQuery,
-      snapshot => callback(snapshot.docs.map(item => ({ ...item.data(), id: item.id })), null),
+      snapshot => {
+        const coops = snapshot.docs.map(item => ({ ...item.data(), id: item.id }));
+        Promise.all(coops.map(coop => trimFreeCoopHistory(coop.id, coop)))
+          .then(() => callback(coops, null))
+          .catch(error => callback(null, error));
+      },
       error => callback(null, error)
     );
     return coopsUnsubscribe;
   },
   async saveCoops(coops) {
     await Promise.all(coops.map(({ id, ...coop }) => setDoc(doc(db, "coops", id), coop, { merge: true })));
+  },
+  watchCoopFeed(coopId, cutoff, callback) {
+    if (coopFeedUnsubscribe) coopFeedUnsubscribe();
+    const feed = collection(db, "coops", coopId, "feed");
+    const feedQuery = cutoff
+      ? query(feed, where("t", ">=", cutoff), orderBy("t", "desc"), limit(100))
+      : query(feed, orderBy("t", "desc"), limit(100));
+    coopFeedUnsubscribe = onSnapshot(
+      feedQuery,
+      snapshot => callback(snapshot.docs.map(item => ({ ...item.data(), id: item.id })).reverse(), null),
+      error => callback(null, error)
+    );
+    return coopFeedUnsubscribe;
+  },
+  async createCoopPost(coopId, text, asset = null) {
+    const user = auth.currentUser;
+    if (!user?.email) throw new Error("Entre novamente para publicar no CO-OP.");
+    const profile = await getDoc(doc(db, "users", user.uid));
+    await addDoc(collection(db, "coops", coopId, "feed"), {
+      by: user.uid,
+      f: user.email,
+      name: (profile.data()?.name || user.displayName || user.email.split("@")[0]).slice(0, 50),
+      x: text,
+      t: Date.now(),
+      assetPath: asset?.path || "",
+      assetKind: asset?.kind || ""
+    });
+  },
+  watchCoopMessages(coopId, channelId, cutoff, callback) {
+    if (coopMessagesUnsubscribe) coopMessagesUnsubscribe();
+    const messages = collection(db, "coops", coopId, "channels", channelId, "messages");
+    const messagesQuery = cutoff
+      ? query(messages, where("t", ">=", cutoff), orderBy("t", "desc"), limit(200))
+      : query(messages, orderBy("t", "desc"), limit(200));
+    coopMessagesUnsubscribe = onSnapshot(
+      messagesQuery,
+      snapshot => callback(snapshot.docs.map(item => ({ ...item.data(), id: item.id })).reverse(), null),
+      error => callback(null, error)
+    );
+    return coopMessagesUnsubscribe;
+  },
+  async createCoopMessage(coopId, channelId, text, asset = null) {
+    const user = auth.currentUser;
+    if (!user?.email) throw new Error("Entre novamente para enviar uma mensagem.");
+    const profile = await getDoc(doc(db, "users", user.uid));
+    await addDoc(collection(db, "coops", coopId, "channels", channelId, "messages"), {
+      from: user.uid,
+      f: user.email,
+      name: (profile.data()?.name || user.displayName || user.email.split("@")[0]).slice(0, 50),
+      x: text,
+      t: Date.now(),
+      kind: asset?.kind || "",
+      assetPath: asset?.path || ""
+    });
+  },
+  async uploadAsset(file, kind, coopId = "") {
+    const user = auth.currentUser;
+    if (!user) throw new Error("Entre novamente para enviar um arquivo.");
+    if (!(file instanceof File) || !["profile", "post", "coop"].includes(kind)) {
+      throw new Error("Arquivo ou destino inválido.");
+    }
+    const profileSnapshot = await getDoc(doc(db, "users", user.uid));
+    if (!profileSnapshot.exists() || profileSnapshot.data().status !== "ok") {
+      throw new Error("A conta não está habilitada para enviar arquivos.");
+    }
+    let ownerPlan = effectivePlan(profileSnapshot.data());
+    if (kind === "coop") {
+      const coopSnapshot = await getDoc(doc(db, "coops", coopId));
+      if (!coopSnapshot.exists() || !coopSnapshot.data().members?.includes(user.email)) {
+        throw new Error("Somente os membros podem enviar arquivos neste CO-OP.");
+      }
+      let ownerUid = coopSnapshot.data().ownerUid;
+      if (!ownerUid) {
+        const ownerQuery = await getDocs(query(collection(db, "users"), where("email", "==", coopSnapshot.data().owner), limit(1)));
+        ownerUid = ownerQuery.docs[0]?.id;
+      }
+      if (!ownerUid) throw new Error("Não foi possível identificar o responsável pelo CO-OP.");
+      const ownerSnapshot = await getDoc(doc(db, "users", ownerUid));
+      if (!ownerSnapshot.exists()) throw new Error("Não foi possível verificar o plano do CO-OP.");
+      ownerPlan = effectivePlan(ownerSnapshot.data());
+    }
+    const limits = { free: 2, basic: 5, standard: 10 };
+    const maxBytes = (limits[ownerPlan] || limits.free) * 1024 * 1024;
+    if (file.size > maxBytes) {
+      throw new Error(`O limite deste plano é ${limits[ownerPlan] || limits.free} MB por arquivo.`);
+    }
+    if (!["image/", "application/pdf", "text/plain"].some(type => file.type.startsWith(type))) {
+      throw new Error("São aceitos arquivos de imagem, PDF ou texto simples.");
+    }
+    if (kind === "profile" && !file.type.startsWith("image/")) {
+      throw new Error("A foto de perfil deve ser uma imagem.");
+    }
+    if (kind === "post" && !file.type.startsWith("image/")) {
+      throw new Error("Publicações aceitam somente imagens como anexo.");
+    }
+    if (kind === "post" && ownerPlan === "free") {
+      throw new Error("No plano Free, publicações não aceitam anexos. Compartilhe mídias usando links do Drive, OneDrive ou YouTube.");
+    }
+    if (kind === "coop" && ownerPlan === "free" && file.type !== "text/plain") {
+      throw new Error("No plano Free, grupos aceitam apenas documentos de texto leves. Use links do Drive, OneDrive ou YouTube para outras mídias.");
+    }
+    if (!file.size) throw new Error("O arquivo está vazio.");
+    const chunkSize = 512 * 1024;
+    const chunkCount = Math.ceil(file.size / chunkSize);
+    const assetId = crypto.randomUUID();
+    const assetRef = doc(db, "assets", assetId);
+    await setDoc(assetRef, {
+      uid: user.uid,
+      email: user.email,
+      kind,
+      coopId: kind === "coop" ? coopId : "",
+      contentType: file.type,
+      name: file.name.slice(0, 120),
+      size: file.size,
+      chunkCount,
+      uploadedBytes: 0,
+      uploadedChunks: 0,
+      createdAt: Date.now(),
+      ready: false
+    });
+    const chunkRefs = [];
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      for (let index = 0; index < chunkCount; index += 1) {
+        const start = index * chunkSize;
+        const chunkRef = doc(db, "assets", assetId, "chunks", String(index).padStart(4, "0"));
+        const content = bytes.subarray(start, Math.min(start + chunkSize, bytes.length));
+        await runTransaction(db, async transaction => {
+          const current = await transaction.get(assetRef);
+          if (!current.exists() || current.data().ready || current.data().uploadedChunks !== index) {
+            throw new Error("O envio das partes do arquivo perdeu sua sequência.");
+          }
+          const existingChunk = await transaction.get(chunkRef);
+          if (existingChunk.exists()) throw new Error("Uma parte duplicada do arquivo foi detectada.");
+          transaction.set(chunkRef, {
+            index,
+            bytes: content.length,
+            data: encodeBase64(content)
+          });
+          transaction.update(assetRef, {
+            uploadedBytes: current.data().uploadedBytes + content.length,
+            uploadedChunks: index + 1
+          });
+        });
+        chunkRefs.push(chunkRef);
+      }
+      await updateDoc(assetRef, { ready: true });
+    } catch (error) {
+      const cleanupErrors = [];
+      await Promise.all(chunkRefs.map(chunkRef => deleteDoc(chunkRef).catch(cleanupError => cleanupErrors.push(cleanupError))));
+      await deleteDoc(assetRef).catch(cleanupError => cleanupErrors.push(cleanupError));
+      if (cleanupErrors.length) {
+        throw new Error(`${error.message} O envio parcial não pôde ser limpo: ${cleanupErrors.map(item => item.message).join("; ")}`, { cause: error });
+      }
+      throw error;
+    }
+    return { path: assetId, url: `coopasset:${assetId}` };
+  },
+  loadAsset,
+  clearAssetCache() {
+    loadedAssetUrls.forEach(url => URL.revokeObjectURL(url));
+    loadedAssetUrls.clear();
+  },
+  async deleteAsset(assetId) {
+    if (!/^[a-f0-9-]{36}$/i.test(assetId)) throw new Error("Identificador de arquivo inválido.");
+    const assetRef = doc(db, "assets", assetId);
+    const snapshot = await getDoc(assetRef);
+    if (!snapshot.exists()) return;
+    const chunks = await getDocs(collection(db, "assets", assetId, "chunks"));
+    await Promise.all(chunks.docs.map(chunk => deleteDoc(chunk.ref)));
+    await deleteDoc(assetRef);
+    const url = loadedAssetUrls.get(assetId);
+    if (url) URL.revokeObjectURL(url);
+    loadedAssetUrls.delete(assetId);
   },
   watchStaffUsers(callback) {
     if (usersUnsubscribe) usersUnsubscribe();
@@ -154,6 +430,54 @@ window.coopFirebase = {
       error => callback(null, error)
     );
     return auditUnsubscribe;
+  },
+  watchSuffixes(isStaff, callback) {
+    if (suffixesUnsubscribe) suffixesUnsubscribe();
+    let betaSeedAttempted = false;
+    suffixesUnsubscribe = onSnapshot(
+      collection(db, "suffixes"),
+      snapshot => {
+        const suffixes = snapshot.docs.map(item => ({ ...item.data(), id: item.id }));
+        callback(suffixes, null);
+        if (isStaff && !betaSeedAttempted && !snapshot.docs.some(item => item.id === "beta")) {
+          betaSeedAttempted = true;
+          setDoc(doc(db, "suffixes", "beta"), {
+            label: "Beta",
+            color: "#34383d",
+            createdAt: Date.now()
+          }).catch(error => callback(null, error));
+        }
+      },
+      error => callback(null, error)
+    );
+    return suffixesUnsubscribe;
+  },
+  async saveSuffix(suffix) {
+    const user = auth.currentUser;
+    if (!user) throw new Error("Entre na conta de desenvolvedor para continuar.");
+    if (!/^[a-f0-9-]{1,64}$/i.test(suffix.id)
+        || typeof suffix.label !== "string"
+        || !suffix.label.trim()
+        || suffix.label.trim().length > 18
+        || !/^#[0-9a-f]{6}$/i.test(suffix.color)) {
+      throw new Error("Informe um nome de até 18 caracteres e uma cor hexadecimal válida.");
+    }
+    await setDoc(doc(db, "suffixes", suffix.id), {
+      label: suffix.label.trim(),
+      color: suffix.color.toLowerCase(),
+      createdAt: Date.now()
+    });
+  },
+  async assignExtraSuffix(uid, suffixId) {
+    if (!auth.currentUser) throw new Error("Entre na conta de desenvolvedor para continuar.");
+    if (typeof uid !== "string" || !uid
+        || (suffixId !== "" && (typeof suffixId !== "string" || !/^[a-f0-9-]{1,64}$/i.test(suffixId)))) {
+      throw new Error("Usuário ou sufixo inválido.");
+    }
+    if (suffixId && !(await getDoc(doc(db, "suffixes", suffixId))).exists()) {
+      throw new Error("O sufixo selecionado não existe mais.");
+    }
+    await updateDoc(doc(db, "users", uid), { extraSuffixId: suffixId || null });
   },
   watchTickets(uid, isStaff, callback) {
     if (ticketsUnsubscribe) ticketsUnsubscribe();
@@ -469,15 +793,13 @@ window.coopFirebase = {
   async createPost(post) {
     const user = auth.currentUser;
     if (!user || !user.email) throw new Error("Entre novamente para publicar.");
-    if (post.i && post.i.length > 750_000) {
-      throw new Error("A imagem ficou muito grande para salvar. Escolha uma imagem menor.");
-    }
     const reference = await addDoc(collection(db, "posts"), {
       uid: user.uid,
       by: user.email,
       t: Date.now(),
       x: post.x,
       i: post.i || "",
+      assetId: post.assetId || "",
       likes: [],
       comments: [],
       views: 0
@@ -501,8 +823,12 @@ window.coopFirebase = {
   recordPostView(postId) {
     return updateDoc(doc(db, "posts", postId), { views: increment(1) });
   },
-  deletePost(postId) {
-    return deleteDoc(doc(db, "posts", postId));
+  async deletePost(postId) {
+    const reference = doc(db, "posts", postId);
+    const snapshot = await getDoc(reference);
+    if (!snapshot.exists()) return;
+    await deleteDoc(reference);
+    if (snapshot.data().assetId) await this.deleteAsset(snapshot.data().assetId);
   },
   saveProfile(profile) {
     const user = auth.currentUser;

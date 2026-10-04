@@ -7,30 +7,66 @@ service cloud.firestore {
       return signed() && request.auth.token.email_verified == true
         && request.auth.token.email == 'negocios.wagnermarques@gmail.com';
     }
-    function active() {
-      return signed()
-        && get(/databases/$(db)/documents/users/$(uid())).data.status == 'ok'
-        && (get(/databases/$(db)/documents/users/$(uid())).data.plan == 'free'
-          || (get(/databases/$(db)/documents/users/$(uid())).data.plan in ['basic', 'standard']
-            && (get(/databases/$(db)/documents/users/$(uid())).data.subscriptionStatus == 'staff-managed'
-              || (get(/databases/$(db)/documents/users/$(uid())).data.planExpiresAt is timestamp
-                && get(/databases/$(db)/documents/users/$(uid())).data.planExpiresAt > request.time))));
+    function activeUser(userId) {
+      let profile = get(/databases/$(db)/documents/users/$(userId)).data;
+      return signed() && profile.get('status', '') == 'ok'
+        && (profile.get('plan', '') == 'free'
+          || (profile.get('plan', '') in ['basic', 'standard']
+            && (profile.get('subscriptionStatus', '') == 'staff-managed'
+              || (profile.get('planExpiresAt', null) is timestamp
+                && profile.get('planExpiresAt', null) > request.time))));
+    }
+    function active() { return activeUser(uid()); }
+    function ownerPlan(owner) {
+      let profile = get(/databases/$(db)/documents/users/$(owner)).data;
+      return profile.get('status', '') == 'ok'
+          && profile.get('plan', '') in ['basic', 'standard']
+          && (profile.get('subscriptionStatus', '') == 'staff-managed'
+            || (profile.get('planExpiresAt', null) is timestamp
+              && profile.get('planExpiresAt', null) > request.time))
+        ? profile.get('plan', 'free') : 'free';
     }
     function memberLimit(owner) {
-      let plan = get(/databases/$(db)/documents/users/$(owner)).data.plan;
-      return plan == 'standard' ? 50 : plan == 'basic' ? 25 : 10;
+      let plan = ownerPlan(owner);
+      return plan == 'standard' ? 2147483647 : plan == 'basic' ? 35 : 10;
+    }
+    function tableLimit(owner) {
+      let plan = ownerPlan(owner);
+      return plan == 'standard' ? 2147483647 : plan == 'basic' ? 5 : 1;
+    }
+    function agendaLimit(owner) {
+      let plan = ownerPlan(owner);
+      return plan == 'standard' ? 2147483647 : plan == 'basic' ? 3 : 1;
+    }
+    function maxFileBytes(plan) {
+      return plan == 'standard' ? 10485760 : plan == 'basic' ? 5242880 : 2097152;
+    }
+    function chunkKey(index) {
+      let keys = [
+        '0000', '0001', '0002', '0003', '0004', '0005', '0006', '0007',
+        '0008', '0009', '0010', '0011', '0012', '0013', '0014', '0015',
+        '0016', '0017', '0018', '0019'
+      ];
+      return index is int && index >= 0 && index < keys.size() ? keys[index] : '';
+    }
+    function encodedChunkSize(byteCount) {
+      return byteCount % 3 == 0 ? (byteCount / 3) * 4
+        : byteCount % 3 == 1 ? ((byteCount - 1) / 3) * 4 + 4
+          : ((byteCount - 2) / 3) * 4 + 4;
     }
     function billingFields() {
       return ['role', 'plan', 'status', 'planPeriod', 'planExpiresAt',
         'lastPaymentAt', 'subscriptionStatus', 'subscriptionPlanKey',
         'preapprovalId', 'pendingBillingIntentId', 'lastCheckoutAt', 'updatedAt',
-        'followerCount', 'followingCount', 'followerChange', 'followingChange'];
+        'followerCount', 'followingCount', 'followerChange', 'followingChange',
+        'extraSuffixId', 'verified'];
     }
     function reservedCreateFields() {
       return ['planPeriod', 'planExpiresAt', 'lastPaymentAt',
         'subscriptionStatus', 'subscriptionPlanKey', 'preapprovalId',
         'pendingBillingIntentId', 'lastCheckoutAt', 'updatedAt',
-        'followerCount', 'followingCount', 'followerChange', 'followingChange'];
+        'followerCount', 'followingCount', 'followerChange', 'followingChange',
+        'extraSuffixId', 'verified'];
     }
     function followingCounterUpdate(u) {
       let change = request.resource.data.get('followingChange', {});
@@ -74,6 +110,112 @@ service cloud.firestore {
     }
     function coop(c) { return get(/databases/$(db)/documents/coops/$(c)).data; }
     function member(c) { return signed() && request.auth.token.email in coop(c).members; }
+    function retainedCoopData(c, messageTime) {
+      return isStaff() || ownerPlan(coop(c).get('ownerUid', uid())) != 'free'
+        || messageTime >= request.time.toMillis() - 1209600000;
+    }
+    function assetData(assetId) {
+      return get(/databases/$(db)/documents/assets/$(assetId)).data;
+    }
+    function attachableCoopAsset(assetId, c, authorUid) {
+      return assetId == '' || (exists(/databases/$(db)/documents/assets/$(assetId))
+        && assetData(assetId).ready == true
+        && assetData(assetId).kind == 'coop'
+        && assetData(assetId).coopId == c
+        && assetData(assetId).uid == authorUid);
+    }
+    function attachablePostAsset(assetId) {
+      return assetId == '' || (exists(/databases/$(db)/documents/assets/$(assetId))
+        && assetData(assetId).ready == true
+        && assetData(assetId).kind == 'post'
+        && assetData(assetId).uid == uid());
+    }
+    function validAssetCreate() {
+      let file = request.resource.data;
+      let ownedPlan = ownerPlan(uid());
+      return active()
+        && file.keys().hasOnly([
+          'uid', 'email', 'kind', 'coopId', 'contentType', 'name', 'size',
+          'chunkCount', 'uploadedBytes', 'uploadedChunks', 'createdAt', 'ready'
+        ])
+        && file.keys().hasAll([
+          'uid', 'email', 'kind', 'coopId', 'contentType', 'name', 'size',
+          'chunkCount', 'uploadedBytes', 'uploadedChunks', 'createdAt', 'ready'
+        ])
+        && file.uid == uid()
+        && file.email == request.auth.token.email
+        && file.name is string && file.name.size() <= 120
+        && file.size is int && file.size > 0
+        && file.chunkCount is int && file.chunkCount >= 1 && file.chunkCount <= 20
+        && file.uploadedBytes == 0 && file.uploadedChunks == 0
+        && file.createdAt is int
+        && file.ready == false
+        && (file.chunkCount - 1) * 524288 < file.size
+        && file.chunkCount * 524288 >= file.size
+        && file.contentType is string
+        && ((file.kind == 'profile'
+              && file.coopId == ''
+              && file.contentType.matches('image/.*')
+              && file.size <= maxFileBytes(ownedPlan))
+          || (file.kind == 'post'
+              && file.coopId == ''
+              && ownedPlan in ['basic', 'standard']
+              && file.contentType.matches('image/.*')
+              && file.size <= maxFileBytes(ownedPlan))
+          || (file.kind == 'coop'
+              && file.coopId is string
+              && member(file.coopId)
+              && activeUser(coop(file.coopId).ownerUid)
+              && file.size <= maxFileBytes(ownerPlan(coop(file.coopId).ownerUid))
+              && (ownerPlan(coop(file.coopId).ownerUid) != 'free'
+                ? file.contentType.matches('image/.*')
+                    || file.contentType == 'application/pdf'
+                    || file.contentType == 'text/plain'
+                : file.contentType == 'text/plain')));
+    }
+    function canReadAsset(assetId) {
+      let file = assetData(assetId);
+      return (signed() && uid() == file.uid) || (file.ready == true
+        && (file.kind in ['profile', 'post'] || member(file.coopId) || isStaff()));
+    }
+    function canDeleteAsset(assetId) {
+      let file = assetData(assetId);
+      return isStaff() || uid() == file.uid
+        || (file.kind == 'coop' && member(file.coopId)
+          && file.createdAt <= request.time.toMillis() - 1209600000);
+    }
+    function assetProgressUpdate(assetId) {
+      let nextIndex = resource.data.uploadedChunks;
+      let chunkPath = /databases/$(db)/documents/assets/$(assetId)/chunks/$(chunkKey(nextIndex));
+      return signed() && active() && resource.data.uid == uid()
+        && resource.data.ready == false
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['uploadedBytes', 'uploadedChunks'])
+        && request.resource.data.uploadedChunks == nextIndex + 1
+        && existsAfter(chunkPath)
+        && getAfter(chunkPath).data.index == nextIndex
+        && request.resource.data.uploadedBytes == resource.data.uploadedBytes + getAfter(chunkPath).data.bytes;
+    }
+    function finishAssetUpload() {
+      return signed() && active() && resource.data.uid == uid()
+        && resource.data.ready == false && request.resource.data.ready == true
+        && request.resource.data.uploadedBytes == resource.data.size
+        && request.resource.data.uploadedChunks == resource.data.chunkCount
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['ready']);
+    }
+    function validAssetChunk(assetId, chunkId) {
+      let file = assetData(assetId);
+      let chunk = request.resource.data;
+      let expectedBytes = chunk.index == file.chunkCount - 1
+        ? file.size - (file.chunkCount - 1) * 524288 : 524288;
+      return signed() && active() && file.uid == uid() && file.ready == false
+        && chunkId == chunkKey(file.uploadedChunks)
+        && chunk.keys().hasOnly(['index', 'bytes', 'data'])
+        && chunk.keys().hasAll(['index', 'bytes', 'data'])
+        && chunk.index is int && chunk.index == file.uploadedChunks
+        && chunk.bytes is int && chunk.bytes == expectedBytes
+        && chunk.data is string && chunk.data.size() == encodedChunkSize(chunk.bytes)
+        && chunk.data.size() <= 700000;
+    }
     function admin(c) {
       return signed() && (request.auth.token.email == coop(c).owner
         || request.auth.token.email in coop(c).mods);
@@ -187,17 +329,37 @@ service cloud.firestore {
       match /private/billing { allow read, write: if false; }
     }
 
+    match /suffixes/{suffixId} {
+      allow read: if true;
+      allow create, update: if isStaff()
+        && request.resource.data.keys().hasOnly(['label', 'color', 'createdAt'])
+        && request.resource.data.keys().hasAll(['label', 'color', 'createdAt'])
+        && request.resource.data.label is string
+        && request.resource.data.label.size() > 0
+        && request.resource.data.label.size() <= 18
+        && request.resource.data.color is string
+        && request.resource.data.color.matches('^#[0-9a-fA-F]{6}$')
+        && request.resource.data.createdAt is int;
+      allow delete: if isStaff();
+    }
+
     match /coops/{c} {
       allow read: if signed() && (request.auth.token.email in resource.data.members || isStaff());
       allow create: if active() && request.resource.data.owner == request.auth.token.email
         && request.resource.data.ownerUid == uid()
         && request.resource.data.members == [request.auth.token.email] && request.resource.data.mods == []
-        && request.resource.data.members.size() <= memberLimit(uid());
+        && request.resource.data.members.size() <= memberLimit(uid())
+        && request.resource.data.tables is list && request.resource.data.tables.size() <= tableLimit(uid())
+        && request.resource.data.ev is list && request.resource.data.ev.size() <= agendaLimit(uid());
       allow update: if isStaff() || (signed()
         && request.resource.data.owner == resource.data.owner
         && request.resource.data.ownerUid == resource.data.get('ownerUid', uid())
         && request.resource.data.owner in request.resource.data.members
         && request.resource.data.members.size() <= memberLimit(resource.data.get('ownerUid', uid()))
+        && request.resource.data.tables is list
+        && request.resource.data.tables.size() <= tableLimit(resource.data.get('ownerUid', uid()))
+        && request.resource.data.ev is list
+        && request.resource.data.ev.size() <= agendaLimit(resource.data.get('ownerUid', uid()))
         && request.resource.data.mods.size() <= 2
         && (request.auth.token.email == resource.data.owner
             || (request.auth.token.email in resource.data.mods && request.resource.data.mods == resource.data.mods)
@@ -213,10 +375,35 @@ service cloud.firestore {
         allow read: if member(c) || isStaff();
         allow create, update, delete: if admin(c) || isStaff();
         match /messages/{m} {
-          allow read: if member(c) || isStaff();
-          allow create: if member(c) && active() && request.resource.data.from == uid();
+          allow read: if (member(c) && retainedCoopData(c, resource.data.t)) || isStaff();
+          allow create: if member(c) && active()
+            && request.resource.data.keys().hasOnly(['from', 'f', 'name', 'x', 't', 'kind', 'assetPath'])
+            && request.resource.data.keys().hasAll(['from', 'f', 'name', 'x', 't', 'kind', 'assetPath'])
+            && request.resource.data.from == uid()
+            && request.resource.data.f == request.auth.token.email
+            && request.resource.data.name is string && request.resource.data.name.size() <= 50
+            && request.resource.data.x is string && request.resource.data.x.size() <= 5000
+            && request.resource.data.t is int
+            && request.resource.data.kind in ['', 'image', 'file']
+            && request.resource.data.assetPath is string
+            && attachableCoopAsset(request.resource.data.assetPath, c, uid());
           allow delete: if admin(c) || isStaff() || resource.data.from == uid();
         }
+      }
+      match /feed/{entry} {
+        allow read: if (member(c) && retainedCoopData(c, resource.data.t)) || isStaff();
+        allow create: if member(c) && active()
+          && request.resource.data.keys().hasOnly(['by', 'f', 'name', 'x', 't', 'assetPath', 'assetKind'])
+          && request.resource.data.keys().hasAll(['by', 'f', 'name', 'x', 't', 'assetPath', 'assetKind'])
+          && request.resource.data.by == uid()
+          && request.resource.data.f == request.auth.token.email
+          && request.resource.data.name is string && request.resource.data.name.size() <= 50
+          && request.resource.data.x is string && request.resource.data.x.size() <= 5000
+          && request.resource.data.t is int
+          && request.resource.data.assetPath is string
+          && request.resource.data.assetKind in ['', 'image', 'file']
+          && attachableCoopAsset(request.resource.data.assetPath, c, uid());
+        allow delete: if admin(c) || isStaff() || resource.data.by == uid();
       }
       match /tables/{t} {
         allow read: if member(c) || isStaff();
@@ -230,10 +417,23 @@ service cloud.firestore {
       }
     }
 
+    match /assets/{assetId} {
+      allow read: if canReadAsset(assetId);
+      allow create: if validAssetCreate();
+      allow update: if assetProgressUpdate(assetId) || finishAssetUpload();
+      allow delete: if canDeleteAsset(assetId);
+      match /chunks/{chunkId} {
+        allow read: if canReadAsset(assetId);
+        allow create: if validAssetChunk(assetId, chunkId);
+        allow update: if false;
+        allow delete: if canDeleteAsset(assetId);
+      }
+    }
+
     match /posts/{p} {
       allow read: if true;
       allow create: if active()
-        && request.resource.data.keys().hasOnly(['uid', 'by', 't', 'x', 'i', 'likes', 'comments', 'views'])
+        && request.resource.data.keys().hasOnly(['uid', 'by', 't', 'x', 'i', 'assetId', 'likes', 'comments', 'views'])
         && request.resource.data.keys().hasAll(['uid', 'by', 't', 'x', 'i', 'likes', 'comments', 'views'])
         && request.resource.data.uid == uid()
         && request.resource.data.by == request.auth.token.email
@@ -242,6 +442,7 @@ service cloud.firestore {
         && request.resource.data.x.size() <= 5000
         && request.resource.data.i is string
         && request.resource.data.i.size() <= 750000
+        && attachablePostAsset(request.resource.data.get('assetId', ''))
         && request.resource.data.likes == []
         && request.resource.data.comments == []
         && request.resource.data.views == 0;
