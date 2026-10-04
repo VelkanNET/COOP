@@ -10,20 +10,32 @@ service firebase.storage {
       return request.resource.contentType.matches('image/.*') && request.resource.size < 5 * 1024 * 1024;
     }
     function inCoop(c) {
-      return signed() && request.auth.uid in firestore.get(/databases/(default)/documents/coops/$(c)).data.members;
+      return signed() && request.auth.uid in firestore.get(/databases/default/documents/coops/$(c)).data.members;
+    }
+    function active(userId) {
+      let profile = firestore.get(/databases/default/documents/users/$(userId)).data;
+      return profile.status == 'ok' && (profile.plan == 'free'
+        || (profile.plan in ['basic', 'standard']
+          && profile.planExpiresAt is timestamp
+          && profile.planExpiresAt > request.time));
+    }
+    function coopOwnerActive(c) {
+      let coop = firestore.get(/databases/default/documents/coops/$(c)).data;
+      return active(coop.owner);
     }
 
     // Mídia de postagens do Home e fotos de perfil: pública na web.
     match /public/{u}/{file} {
       allow read: if true;
-      allow create, update: if signed() && request.auth.uid == u && img();
+      allow create, update: if signed() && request.auth.uid == u && active(u) && img();
       allow delete: if (signed() && request.auth.uid == u) || isStaff();
     }
 
     // Mídia privada dos CO-OPs: só membros (e a Staff).
     match /coops/{c}/{file} {
       allow read: if inCoop(c) || isStaff();
-      allow create: if inCoop(c) && request.resource.size < 50 * 1024 * 1024;
+      allow create: if inCoop(c) && active(request.auth.uid) && coopOwnerActive(c)
+        && request.resource.size < 50 * 1024 * 1024;
       allow delete: if isStaff();
     }
   }

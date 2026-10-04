@@ -1,5 +1,5 @@
 {
-  "hosting": { "public": "public", "ignore": ["firebase.json", "**/.*"], "rewrites": [{ "source": "**", "destination": "/index.html" }] },
-  "firestore": { "rules": "firestore.rules" },
+  "hosting": { "public": ".", "ignore": ["firebase.json", "firestore.rules", "storage.rules", ".firebaserc", "functions/**", "cloudflare/**", "wrangler.toml", "node_modules/**", "**/.*"], "rewrites": [{ "source": "**", "destination": "/index.html" }] },
+  "firestore": [{ "database": "default", "rules": "firestore.rules" }],
   "storage": { "rules": "storage.rules" }
 }
